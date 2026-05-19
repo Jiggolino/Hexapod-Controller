@@ -582,6 +582,7 @@ class HexapodControl:
     def _start_threads(self):
         threading.Thread(target=self._controller_thread,    daemon=True).start()
         threading.Thread(target=self._battery_thread,       daemon=True).start()
+        threading.Thread(target=self._telemetry_thread,     daemon=True).start()
         threading.Thread(target=self._network_read_thread,  daemon=True).start()
         threading.Thread(target=self._back_paddle_thread,   daemon=True).start()
         threading.Thread(target=self._ping_reconnect_thread, daemon=True).start()
@@ -806,6 +807,17 @@ class HexapodControl:
                     self.socket.sendall(b"/MODE\n")
                 except Exception:
                     pass
+
+    def _telemetry_thread(self):
+        """Poll STAB/TILT/TOF at 10 Hz for fast display updates."""
+        interval = 0.1
+        while self.running:
+            if self.connected and self.socket:
+                try:
+                    self.socket.sendall(b"/STAB\n/TILT\n/TOF\n")
+                except Exception:
+                    pass
+            time.sleep(interval)
 
     def _network_read_thread(self):
         buf = ""
