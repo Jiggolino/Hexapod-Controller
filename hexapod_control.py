@@ -1,42 +1,64 @@
 #!/usr/bin/env python3
 """
 hexapod_control.py - Hexapod Remote Control Client
-Runs on laptop/viewing device
-Connects to Pi5 relay, sends controller input, receives camera stream & telemetry
-Modern dark-mode UI with floating info panels
+Runs on the laptop / handheld (developed on a Lenovo Legion Go, Linux + X11).
+Connects to the Pi 5 relay, sends controller input, receives the camera stream
+and telemetry. Dark-mode fullscreen UI with info panels.
 """
 
-import tkinter as tk
-from tkinter import ttk
-import pygame
-import threading
-import socket
-import time
-import sys
-import struct
-import os
+import argparse
+import array
+import fcntl
 import glob
 import re
+import socket
+import struct
 import subprocess
+import threading
+import time
+import tkinter as tk
 from collections import deque
 from datetime import datetime
+from tkinter import ttk
 
 import gi
 gi.require_version('Gst', '1.0')
 gi.require_version('GstVideo', '1.0')
-from gi.repository import Gst, GstVideo, GLib
+# GstVideo is not referenced by name, but importing it is what makes
+# set_window_handle() (the GstVideoOverlay interface) available on the sink.
+from gi.repository import Gst, GstVideo  # noqa: E402,F401
+import pygame  # noqa: E402
 
 Gst.init(None)
 
+# ── Network defaults (overridable on the command line, see --help)
+DEFAULT_RELAY_HOST   = "100.122.9.49"   # Pi 5 relay (Tailscale IP)
+DEFAULT_RELAY_PORT   = 5000             # command / telemetry link (TCP)
+DEFAULT_SPEAKER_PORT = 5001             # text-to-speech (TCP)
+DEFAULT_CAMERA_PORT  = 5005             # camera stream (RTP/H.264 over UDP, incoming)
+
+# ── Gamepad mapping (Legion Go as seen by pygame/SDL: Xbox-style layout)
+AXIS_LX, AXIS_LY = 0, 1
+AXIS_LT          = 2    # rests at -1, fully pressed = +1
+AXIS_RX, AXIS_RY = 3, 4
+AXIS_RT          = 5    # rests at -1, fully pressed = +1
+BTN_A, BTN_B, BTN_X, BTN_Y = 0, 1, 2, 3
+BTN_LB, BTN_RB             = 4, 5
+BTN_BACK, BTN_START        = 6, 7
+BTN_R3, BTN_L3             = 8, 9
+STICK_DEADZONE    = 0.12
+TRIGGER_THRESHOLD = -0.9   # trigger axis above this counts as pressed
+
 # ── Legion Go back-paddle key codes (EV_KEY codes on the "Keyboard" evdev device)
-# Run with the debug panel open to see which codes fire when you press each button,
-# then update these constants to match.
-BACK_KEY_M1 = 152   # KEY_PROG1
-BACK_KEY_M2 = 153   # KEY_PROG2
-BACK_KEY_M3 = 154   # KEY_PROG3
-BACK_KEY_Y1 = 155   # KEY_PROG4
-BACK_KEY_Y2 = 156   # KEY_PROG5 (try 140 / KEY_CALC if wrong)
-BACK_KEY_Y3 = 157   # KEY_PROG6
+# These depend on how the paddles are mapped on the device. Use `sudo evtest`
+# on the Legion keyboard device to see which codes fire when you press each
+# paddle, then update these constants to match.
+BACK_KEY_M1 = 152
+BACK_KEY_M2 = 153
+BACK_KEY_M3 = 154
+BACK_KEY_Y1 = 155
+BACK_KEY_Y2 = 156   # try 140 (KEY_CALC) if wrong
+BACK_KEY_Y3 = 157
 
 # evdev input_event layout on 64-bit Linux: timeval(8+8) + type(2) + code(2) + value(4) = 24 bytes
 _EV_FMT  = 'llHHi'
@@ -48,7 +70,6 @@ def _find_legion_keyboard_device():
     for path in glob.glob('/dev/input/event*'):
         try:
             with open(path, 'rb') as f:
-                import fcntl, array
                 EVIOCGNAME = 0x81004506
                 buf = array.array('B', [0] * 256)
                 fcntl.ioctl(f, EVIOCGNAME, buf)
@@ -72,28 +93,24 @@ class HexapodControl:
     FG_ERROR   = "#ff3333"
     BORDER_COLOR = "#404040"
 
-    def __init__(self, root):
+    def __init__(self, root, host=DEFAULT_RELAY_HOST, relay_port=DEFAULT_RELAY_PORT,
+                 speaker_port=DEFAULT_SPEAKER_PORT, camera_port=DEFAULT_CAMERA_PORT):
         self.root = root
         self.root.title("Hexapod Remote Control")
         self.root.configure(bg=self.BG_DARK)
         self.root.attributes('-fullscreen', True)
 
-        # Configuration - Tailscale IPs
-        self.RELAY_HOST             = "100.122.9.49"
-        self.RELAY_PORT             = 5000
-        self.SPEAKER_PORT           = 5001
-        self.CAMERA_PORT            = 5005
+        # Configuration
+        self.RELAY_HOST             = host
+        self.RELAY_PORT             = relay_port
+        self.SPEAKER_PORT           = speaker_port
+        self.CAMERA_PORT            = camera_port
         self.CONTROLLER_SEND_RATE   = 50   # Hz
         self.BATTERY_UPDATE_INTERVAL = 1.0
 
         # Video stream
         self._gst_pipeline = None
         self._video_xid    = None
-
-        # Controller axis mapping
-        self.DEAD  = 0.12
-        self.AX_LX, self.AX_LY = 0, 1
-        self.AX_RX, self.AX_RY = 3, 4
 
         # Battery EMA filter — same principle as IMU complementary filter.
         # alpha near 0 = heavy smoothing; alpha near 1 = fast tracking.
@@ -104,6 +121,7 @@ class HexapodControl:
         self.running         = True
         self.connected       = False
         self.socket          = None
+        self._send_lock      = threading.Lock()   # several threads write to the socket
         self.joystick        = None
         self.battery_voltage = 0.0
         self.battery_percent = 0
@@ -120,7 +138,6 @@ class HexapodControl:
             BACK_KEY_Y2: False,
             BACK_KEY_Y3: False,
         }
-        self._last_raw_key = None   # shown in debug panel
 
         pygame.init()
         pygame.joystick.init()
@@ -184,10 +201,10 @@ class HexapodControl:
 
         self.video_label = tk.Label(
             self.video_frame,
-            text="[Connecting to stream on port 5005]\nMake sure relay is streaming with GStreamer",
+            text=f"[Connecting to stream on port {self.CAMERA_PORT}]\n"
+                 "Make sure relay is streaming with GStreamer",
             bg=self.BG_PANEL, fg=self.FG_TEXT, font=("Arial", 16))
         self.video_label.pack(fill=tk.BOTH, expand=True)
-
 
         # Command bar — spans full width below video
         cmd_bar = tk.Frame(left_frame, bg=self.BG_PANEL, height=44)
@@ -314,7 +331,6 @@ class HexapodControl:
                                    bg=self.BG_PANEL, fg=self.FG_TEXT, font=("Arial", 10))
         self.dpad_label.pack(side=tk.LEFT, padx=10)
 
-
     def _create_stats_panel(self, parent):
         panel = self._create_panel(parent, "STATS")
         self.fps_label    = tk.Label(panel, text="FPS: 0",
@@ -356,15 +372,24 @@ class HexapodControl:
         self.joystick.init()
         self._log(f"Using: {self.joystick.get_name()}")
 
+    def _open_relay_socket(self):
+        """Return a connected TCP socket to the relay; raises OSError on failure."""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.settimeout(3.0)
+            sock.connect((self.RELAY_HOST, self.RELAY_PORT))
+        except OSError:
+            sock.close()
+            raise
+        return sock
+
     def _connect_relay(self):
         try:
-            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.socket.settimeout(3.0)
-            self.socket.connect((self.RELAY_HOST, self.RELAY_PORT))
+            self.socket = self._open_relay_socket()
             self.connected = True
             self.status_label.config(text="CONNECTED", fg=self.FG_SUCCESS)
             self._log(f"Connected to relay {self.RELAY_HOST}:{self.RELAY_PORT}")
-        except Exception as e:
+        except OSError as e:
             self.connected = False
             self.status_label.config(text="DISCONNECTED", fg=self.FG_ERROR)
             self._log(f"Relay error: {e}")
@@ -496,13 +521,15 @@ class HexapodControl:
 
             rid = self._rounded_rect(cvs, 1, 1, w - 1, key_h - 1, 10,
                                      fill=bg, outline='#3a3a5a')
-            tid = cvs.create_text(w // 2, key_h // 2, text=label,
-                                  fill=fg, font=('Arial', 13, 'bold'))
+            cvs.create_text(w // 2, key_h // 2, text=label,
+                            fill=fg, font=('Arial', 13, 'bold'))
 
             def _press(e, k=key):
                 self._osk_press(k)
-            def _enter(e, c=cvs, r=rid, orig=bg):
+
+            def _enter(e, c=cvs, r=rid):
                 c.itemconfig(r, fill='#4a4a6a')
+
             def _leave(e, c=cvs, r=rid, orig=bg):
                 c.itemconfig(r, fill=orig)
 
@@ -554,7 +581,7 @@ class HexapodControl:
                 self._build_osk_window()
                 return
         # Move cursor to end in the embedded entry
-        if hasattr(self, '_osk_entry') and self._osk_entry.winfo_exists():
+        if self._osk_entry is not None and self._osk_entry.winfo_exists():
             self._osk_entry.icursor(tk.END)
 
     def _hide_osk(self):
@@ -563,12 +590,14 @@ class HexapodControl:
         self._osk = None
 
     def _send_command(self):
-        """Send the text from the command bar to the hexapod on port 5001."""
+        """Send the text from the command bar to the relay's speaker port,
+        where it is spoken by the robot (text-to-speech)."""
         msg = self._cmd_var.get().strip()
         if not msg:
             return
         self._cmd_var.set('')
         self._log(f"CMD → {msg}")
+
         def _do_send():
             try:
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -594,14 +623,25 @@ class HexapodControl:
     def _mark_disconnected(self):
         """Close the socket and flag as disconnected (safe to call from any thread)."""
         self.connected = False
+        sock, self.socket = self.socket, None
         try:
-            if self.socket:
-                self.socket.close()
-        except Exception:
+            if sock:
+                sock.close()
+        except OSError:
             pass
-        self.socket = None
         self.root.after(0, lambda: self.status_label.config(
             text="DISCONNECTED", fg=self.FG_ERROR))
+
+    def _send(self, data):
+        """Send bytes to the relay. Returns False when not connected; raises
+        OSError when the link is broken. The lock keeps protocol lines written
+        by different threads from being interleaved."""
+        sock = self.socket
+        if not self.connected or sock is None:
+            return False
+        with self._send_lock:
+            sock.sendall(data)
+        return True
 
     def _ping_reconnect_thread(self):
         """Ping the Pi5 every 2 s, show latency, and auto-reconnect when possible."""
@@ -647,17 +687,14 @@ class HexapodControl:
     def _try_reconnect(self):
         """Attempt a fresh TCP connection to the relay."""
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(3.0)
-            sock.connect((self.RELAY_HOST, self.RELAY_PORT))
-            self.socket    = sock
-            self.connected = True
-            self.root.after(0, lambda: (
-                self.status_label.config(text="CONNECTED", fg=self.FG_SUCCESS),
-            ))
-            self._log("Reconnected to relay")
-        except Exception:
-            pass   # will retry after next ping
+            sock = self._open_relay_socket()
+        except OSError:
+            return   # will retry after next ping
+        self.socket    = sock
+        self.connected = True
+        self.root.after(0, lambda: self.status_label.config(
+            text="CONNECTED", fg=self.FG_SUCCESS))
+        self._log("Reconnected to relay")
 
     # ──────────────────────────────────────────────
     # Controller helpers
@@ -667,7 +704,12 @@ class HexapodControl:
         if not self.joystick or self.joystick.get_numaxes() <= axis:
             return 0.0
         v = self.joystick.get_axis(axis)
-        return 0.0 if abs(v) < self.DEAD else v
+        return 0.0 if abs(v) < STICK_DEADZONE else v
+
+    def _trigger_pressed(self, axis):
+        if not self.joystick or self.joystick.get_numaxes() <= axis:
+            return 0
+        return 1 if self.joystick.get_axis(axis) > TRIGGER_THRESHOLD else 0
 
     def _button_value(self, button):
         if not self.joystick or self.joystick.get_numbuttons() <= button:
@@ -701,40 +743,40 @@ class HexapodControl:
                 pygame.event.pump()
 
                 # Analog sticks
-                lsx = self._to_int(self._axis_value(0))
-                lsy = self._to_int(self._axis_value(1))
-                rsx = self._to_int(self._axis_value(3))
-                rsy = self._to_int(self._axis_value(4))
+                lsx = self._to_int(self._axis_value(AXIS_LX))
+                lsy = self._to_int(self._axis_value(AXIS_LY))
+                rsx = self._to_int(self._axis_value(AXIS_RX))
+                rsy = self._to_int(self._axis_value(AXIS_RY))
 
-                # Triggers (axis 2 = LT, axis 5 = RT; resting at -1, pressed toward +1)
-                lt_pressed = 1 if self.joystick.get_axis(2) > -0.9 else 0
-                rt_pressed = 1 if self.joystick.get_axis(5) > -0.9 else 0
+                # Triggers (resting at -1, pressed toward +1)
+                lt_pressed = self._trigger_pressed(AXIS_LT)
+                rt_pressed = self._trigger_pressed(AXIS_RT)
 
                 # D-pad
                 hat = self.joystick.get_hat(0) if self.joystick.get_numhats() > 0 else (0, 0)
 
-                # Face buttons: X(2) A(0) B(1) Y(3)
+                # Face buttons
                 face = (
-                    (self._button_value(2) << 0) |
-                    (self._button_value(0) << 1) |
-                    (self._button_value(1) << 2) |
-                    (self._button_value(3) << 3)
+                    (self._button_value(BTN_X) << 0) |
+                    (self._button_value(BTN_A) << 1) |
+                    (self._button_value(BTN_B) << 2) |
+                    (self._button_value(BTN_Y) << 3)
                 )
 
-                # Stick clicks: L3=btn9, R3=btn8 (Legion Go mapping)
+                # Stick clicks (Legion Go mapping)
                 sticks = (
-                    (self._button_value(9) << 0) |
-                    (self._button_value(8) << 1)
+                    (self._button_value(BTN_L3) << 0) |
+                    (self._button_value(BTN_R3) << 1)
                 )
 
                 # Shoulder / system buttons
                 trig = (
-                    (lt_pressed              << 0) |
-                    (self._button_value(6)   << 1) |  # Back/View
-                    (self._button_value(4)   << 2) |  # LB
-                    (rt_pressed              << 3) |
-                    (self._button_value(5)   << 4) |  # RB
-                    (self._button_value(7)   << 5)    # Start/Menu
+                    (lt_pressed                     << 0) |
+                    (self._button_value(BTN_BACK)   << 1) |  # Back/View
+                    (self._button_value(BTN_LB)     << 2) |
+                    (rt_pressed                     << 3) |
+                    (self._button_value(BTN_RB)     << 4) |
+                    (self._button_value(BTN_START)  << 5)    # Start/Menu
                 )
 
                 # Back paddles from evdev thread
@@ -751,13 +793,12 @@ class HexapodControl:
                 pkt = (f"/CONTROLL/{rsx},{rsy},{lsx},{lsy},"
                        f"{hat[0]},{hat[1]},{face},{sticks},{trig},{back}\n")
 
-                if self.connected and self.socket:
-                    try:
-                        self.socket.sendall(pkt.encode("ascii"))
+                try:
+                    if self._send(pkt.encode("ascii")):
                         self.packet_count += 1
                         self.fps_counter  += 1
-                    except Exception:
-                        self._mark_disconnected()
+                except OSError:
+                    self._mark_disconnected()
 
                 # Schedule UI update on main thread — tkinter is not thread-safe
                 self.root.after(0, lambda lsx=lsx, lsy=lsy, rsx=rsx, rsy=rsy,
@@ -785,9 +826,6 @@ class HexapodControl:
                         break
                     _, _, etype, code, value = struct.unpack(_EV_FMT, raw)
                     if etype == EV_KEY:
-                        # Always show last key code so user can discover M/Y mappings
-                        self._last_raw_key = code
-                        # Update back-paddle state if this is a known code
                         if code in self._back_state:
                             self._back_state[code] = bool(value)
         except PermissionError:
@@ -798,35 +836,35 @@ class HexapodControl:
     def _battery_thread(self):
         while self.running:
             time.sleep(self.BATTERY_UPDATE_INTERVAL)
-            if self.connected and self.socket:
-                try:
-                    self.socket.sendall(b"/BATTERY/V\n")
+            try:
+                if self._send(b"/BATTERY/V\n"):
                     time.sleep(0.05)
-                    self.socket.sendall(b"/BATTERY/P\n")
+                    self._send(b"/BATTERY/P\n")
                     time.sleep(0.05)
-                    self.socket.sendall(b"/MODE\n")
-                except Exception:
-                    pass
+                    self._send(b"/MODE\n")
+            except OSError:
+                pass   # the reader thread notices and marks the link down
 
     def _telemetry_thread(self):
         """Poll STAB/TILT/TOF at 10 Hz for fast display updates."""
         interval = 0.1
         while self.running:
-            if self.connected and self.socket:
-                try:
-                    self.socket.sendall(b"/STAB\n/TILT\n/TOF\n")
-                except Exception:
-                    pass
+            try:
+                self._send(b"/STAB\n/TILT\n/TOF\n")
+            except OSError:
+                pass   # the reader thread notices and marks the link down
             time.sleep(interval)
 
     def _network_read_thread(self):
         buf = ""
         while self.running:
-            if not self.connected or not self.socket:
+            sock = self.socket
+            if not self.connected or sock is None:
+                buf = ""
                 time.sleep(0.5)
                 continue
             try:
-                data = self.socket.recv(1024)
+                data = sock.recv(1024)
                 if not data:
                     self._mark_disconnected()
                     self._log("Relay closed connection")
@@ -842,7 +880,7 @@ class HexapodControl:
                             volt = float(line.split("/")[-1])
                             self.battery_voltage = volt
                             self.root.after(0, lambda v=volt: self.volt_label.config(text=f"Voltage: {v:.2f} V"))
-                        except Exception:
+                        except ValueError:
                             pass
                     elif line.startswith("/BATTERY/P/"):
                         try:
@@ -859,7 +897,7 @@ class HexapodControl:
                                 self.percent_label.config(text=f"Capacity: {p} %"),
                                 self.battery_bar.config(value=p)
                             ))
-                        except Exception:
+                        except ValueError:
                             pass
                     elif line.startswith("/MODE/"):
                         mode = line[6:].strip()
@@ -878,7 +916,7 @@ class HexapodControl:
                                     self.roll_label.config(text=f"Roll:  {r:.2f} °"),
                                     self.pitch_label.config(text=f"Pitch: {p:.2f} °")
                                 ))
-                        except Exception:
+                        except ValueError:
                             pass
                     elif line.startswith("/TOF/"):
                         try:
@@ -886,14 +924,14 @@ class HexapodControl:
                             distance_mm = float(distance)
                             self.root.after(0, lambda d=distance_mm:
                                 self.tof_label.config(text=f"Distance: {d:.0f} mm"))
-                        except Exception:
+                        except ValueError:
                             pass
                     elif line and not line.startswith("/CONTROLL"):
                         self._log(f"RX: {line[:50]}")
 
             except socket.timeout:
                 pass
-            except Exception:
+            except OSError:
                 self._mark_disconnected()
                 time.sleep(0.1)
 
@@ -932,7 +970,6 @@ class HexapodControl:
             (-1,1): "↖", (1, 1): "↗", (-1,-1): "↙", (1,-1): "↘", (0,0): "◯"
         }
         self.dpad_label.config(text=dpad_map.get(hat, "?"))
-
 
     def _update_fps_display(self):
         self.fps_label.config(text=f"FPS: {self.fps_counter}")
@@ -979,16 +1016,32 @@ class HexapodControl:
 
         bus = pipeline.get_bus()
         bus.enable_sync_message_emission()
-        bus.add_signal_watch()
         bus.connect("sync-message::element", self._on_gst_sync_message)
-        bus.connect("message",               self._on_gst_message)
 
         self._gst_pipeline = pipeline
         pipeline.set_state(Gst.State.PLAYING)
         self._log("Pipeline started — waiting for stream...")
+        self._poll_gst_bus()
+
+    def _poll_gst_bus(self):
+        """Fetch pending error/EOS messages from the pipeline bus.
+
+        No GLib main loop is running (tkinter owns the main thread), so a bus
+        signal watch would never fire; the bus is polled from the tk loop."""
+        if not self.running or self._gst_pipeline is None:
+            return
+        bus = self._gst_pipeline.get_bus()
+        while True:
+            msg = bus.pop_filtered(Gst.MessageType.ERROR | Gst.MessageType.EOS)
+            if msg is None:
+                break
+            self._on_gst_message(msg)
+        self.root.after(250, self._poll_gst_bus)
 
     def _on_gst_sync_message(self, bus, msg):
-        if msg.get_structure().get_name() == "prepare-window-handle":
+        # Called from a GStreamer streaming thread.
+        structure = msg.get_structure()
+        if structure is not None and structure.get_name() == "prepare-window-handle":
             msg.src.set_window_handle(self._video_xid)
             self.root.after(0, self._show_video_active)
 
@@ -997,19 +1050,15 @@ class HexapodControl:
         self.video_status.config(text="Stream active", fg=self.FG_SUCCESS)
         self._log("Stream active — video embedded")
 
-    def _on_gst_message(self, bus, msg):
+    def _on_gst_message(self, msg):
         t = msg.type
         if t == Gst.MessageType.ERROR:
             err, _ = msg.parse_error()
-            self.root.after(0, lambda: (
-                self._log(f"GST error: {err.message}"),
-                self.video_status.config(text="Stream error", fg=self.FG_ERROR)
-            ))
+            self._log(f"GST error: {err.message}")
+            self.video_status.config(text="Stream error", fg=self.FG_ERROR)
         elif t == Gst.MessageType.EOS:
-            self.root.after(0, lambda: (
-                self._log("GST: end of stream"),
-                self.video_status.config(text="Stream ended", fg=self.FG_WARNING)
-            ))
+            self._log("GST: end of stream")
+            self.video_status.config(text="Stream ended", fg=self.FG_WARNING)
 
     # ──────────────────────────────────────────────
     # Shutdown
@@ -1022,15 +1071,35 @@ class HexapodControl:
                 self._gst_pipeline.set_state(Gst.State.NULL)
             except Exception:
                 pass
-        if self.socket:
-            self.socket.close()
+        self.connected = False
+        sock, self.socket = self.socket, None
+        if sock:
+            try:
+                sock.close()
+            except OSError:
+                pass
         pygame.quit()
         self.root.destroy()
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Hexapod remote control client.")
+    parser.add_argument("--host", default=DEFAULT_RELAY_HOST,
+                        help="address of the Pi 5 relay (default: %(default)s)")
+    parser.add_argument("--port", default=DEFAULT_RELAY_PORT, type=int,
+                        help="TCP port of the relay command link (default: %(default)s)")
+    parser.add_argument("--speaker-port", default=DEFAULT_SPEAKER_PORT, type=int,
+                        help="TCP port of the relay text-to-speech server (default: %(default)s)")
+    parser.add_argument("--camera-port", default=DEFAULT_CAMERA_PORT, type=int,
+                        help="local UDP port the camera stream arrives on (default: %(default)s)")
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
     root = tk.Tk()
-    app  = HexapodControl(root)
+    app  = HexapodControl(root, host=args.host, relay_port=args.port,
+                          speaker_port=args.speaker_port, camera_port=args.camera_port)
     root.protocol("WM_DELETE_WINDOW", app.on_closing)
     root.mainloop()
 

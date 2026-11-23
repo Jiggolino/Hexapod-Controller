@@ -1,3 +1,8 @@
 #!/bin/bash
-export PYTHONPATH="$(dirname "$(readlink -f "$0")")/.venv/lib/python3.13/site-packages:$PYTHONPATH"
-exec python3 "$(dirname "$(readlink -f "$0")")/hexapod_control.py" "$@"
+# Start the controller. Uses the virtual environment in .venv if there is one,
+# otherwise the system python3. All arguments are passed on (see --help).
+DIR="$(dirname "$(readlink -f "$0")")"
+if [ -x "$DIR/.venv/bin/python" ]; then
+    exec "$DIR/.venv/bin/python" "$DIR/hexapod_control.py" "$@"
+fi
+exec python3 "$DIR/hexapod_control.py" "$@"
